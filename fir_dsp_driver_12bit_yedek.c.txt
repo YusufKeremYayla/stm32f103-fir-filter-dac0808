@@ -1,0 +1,242 @@
+#include "fir_dsp_driver.h"
+
+/* CubeMX'in oluşturduğu donanım tanıtıcıları (main.c) */
+extern ADC_HandleTypeDef hadc1;
+extern TIM_HandleTypeDef htim3;
+extern DMA_HandleTypeDef hdma_tim3_ch4_up;
+
+/* Dahili ADC bağlantısı:
+ *  SIGNAL_SHIFT (seviye kaydırıcı çıkışı, 0.3-2.7 V) -> PA1 = ADC1_IN1
+ *  Örnekleme: TIM3 TRGO (1 kHz) her taşmada bir dönüşüm başlatır,
+ *             sonuç DMA1 Kanal 1 ile adc_buffer[]'a yazılır (dairesel).
+ *  12-bit sonuç (0-4095) / 16 -> 8-bit ölçek (0-255.9), DAC0808 8-bit olduğu için.
+ */
+#define ADC_TO_8BIT(x)  ((float)(x) * (1.0f / 16.0f))
+
+/* FIR Filtre Yapısı (CMSIS-DSP kurulumuna gerek kalmadan aynı yapı) */
+typedef struct {
+    uint16_t numTaps;
+    float *pState;
+    const float *pCoeffs;
+} fir_instance_f32;
+
+static fir_instance_f32 filter1;
+static float State[halfN + NUM_TAPS - 1U]; // Durum (geçmiş) tamponu
+
+/* MATLAB'dan alınan 36 katsayı */
+static const float Coeffs[NUM_TAPS] = {
+		1.044726838926e-05  ,  7.381821858659e-05 ,  0.000283814494307  ,  0.0007547258959236,
+		0.001489764607338   ,  0.002161191993284  ,  0.001949415898098  ,  -0.0002975749787672,
+		-0.005379191268091  ,  -0.01264056969305  ,  -0.0190220081338   ,  -0.01910321909716,
+		-0.006731993407864  ,  0.02201592803316   ,  0.06582399924534   ,  0.1168503000288,
+		0.1624067362577     ,  0.1893543148853    ,  0.1893543148853    ,  0.1624067362577,
+		0.1168503000288     ,  0.06582399924534   ,  0.02201592803316   ,  -0.006731993407864,
+		-0.01910321909716   ,  -0.0190220081338   ,  -0.01264056969305  ,  -0.005379191268091,
+		-0.0002975749787672 ,  0.001949415898098  ,  0.002161191993284  ,  0.001489764607338,
+		0.0007547258959236  ,  0.000283814494307  ,  7.381821858659e-05 ,  1.044726838926e-05
+};
+
+/* Giriş tamponu: dahili ADC'nin 12-bit örnekleri (DMA doldurur) */
+volatile uint16_t adc_buffer[N];
+
+/* Çıkış tamponu: TIM3 DMA ile GPIOB->ODR'ye (PB0-PB7, DAC0808) yazılır */
+#if (TEST_MODE == 1)
+/* Mod 1: 8-Bit (0-255 arası, 128 merkezli) 32 noktalı hazır Sinüs Tablosu */
+volatile uint16_t dac_buffer[N] = {
+    128, 152, 176, 198, 218, 234, 245, 253,
+    255, 253, 245, 234, 218, 198, 176, 152,
+    128, 103,  79,  57,  37,  21,  10,   2,
+      0,   2,  10,  21,  37,  57,  79, 103
+};
+#else
+volatile uint16_t dac_buffer[N] = {0};
+#endif
+
+/* Kesme Kontrol Bayrakları */
+volatile int flag_half = 0;
+volatile int flag_full = 0;
+
+/* --- Blok FIR Filtre İlklendirme (arm_fir_init_f32 karşılığı) --- */
+static void my_fir_init_f32(fir_instance_f32 *S, uint16_t numTaps, const float *pCoeffs, float *pState)
+{
+    S->numTaps = numTaps;
+    S->pCoeffs = pCoeffs;
+    S->pState  = pState;
+    for (uint16_t i = 0; i < (halfN + numTaps - 1U); i++) {
+        pState[i] = 0.0f;
+    }
+}
+
+/* --- Blok FIR Hesaplama (arm_fir_f32 karşılığı) --- */
+static void my_fir_f32(const fir_instance_f32 *S, const float *pSrc, float *pDst, uint32_t blockSize)
+{
+    float *pState = S->pState;
+    const float *pCoeffs = S->pCoeffs;
+    uint16_t numTaps = S->numTaps;
+
+    /* 1. Yeni gelen blockSize kadar örneği State dizisinin sonuna kopyala */
+    for (uint32_t i = 0; i < blockSize; i++) {
+        pState[numTaps - 1U + i] = pSrc[i];
+    }
+
+    /* 2. Her örnek için 36 katsayılı konvolüsyon toplamı */
+    for (uint32_t n = 0; n < blockSize; n++) {
+        float acc = 0.0f;
+        for (uint16_t k = 0; k < numTaps; k++) {
+            acc += pCoeffs[k] * pState[numTaps - 1U + n - k];
+        }
+        pDst[n] = acc;
+    }
+
+    /* 3. Bir sonraki blok için geçmiş örnekleri başa kaydır */
+    for (uint16_t i = 0; i < (numTaps - 1U); i++) {
+        pState[i] = pState[blockSize + i];
+    }
+}
+
+/* --- Açılışta tek bir örnek oku (yazılım tetiklemeli, yoklamalı) ---
+ * ADC normalde TIM3 TRGO ile tetikleniyor. Filtre geçmişini doldurmak için
+ * başlangıçta bir kez geçici olarak SWSTART tetiğine alıp bir dönüşüm yapılır,
+ * sonra ayar eski haline döndürülür. */
+static uint16_t adc_read_once(void)
+{
+    uint32_t cr2 = ADC1->CR2;
+    ADC1->CR2 = (cr2 & ~ADC_CR2_EXTSEL) | ADC_CR2_EXTSEL | ADC_CR2_EXTTRIG | ADC_CR2_ADON; /* EXTSEL=111: SWSTART */
+    ADC1->CR2 |= ADC_CR2_SWSTART;
+    uint32_t t = 100000U;
+    while (((ADC1->SR & ADC_SR_EOC) == 0U) && (--t != 0U)) { }
+    uint16_t v = (uint16_t)(ADC1->DR & 0x0FFFU);
+    ADC1->CR2 = cr2;
+    return v;
+}
+
+/* ============================================================================
+ * INITIALIZATION
+ * ============================================================================ */
+void filter_init(void)
+{
+    /* 1. FIR Filtreyi İlklendir */
+    my_fir_init_f32(&filter1, NUM_TAPS, Coeffs, State);
+
+    /* 2. ADC kalibrasyonu (ADC'yi açar ve iç kalibrasyonu yapar) */
+    HAL_ADCEx_Calibration_Start(&hadc1);
+
+#if (TEST_MODE == 3)
+    /* 3. Açılış geçişini önle: bir örnek oku, filtre geçmişini ve DAC tamponunu onunla doldur */
+    float first = ADC_TO_8BIT(adc_read_once());
+    for (uint32_t i = 0; i < (halfN + NUM_TAPS - 1U); i++) {
+        State[i] = first;
+    }
+    for (uint32_t i = 0; i < N; i++) {
+        dac_buffer[i] = (uint16_t)(first + 0.5f);
+    }
+#endif
+
+    /* 4. Giriş DMA: her TIM3 TRGO'da 1 dönüşüm -> adc_buffer (dairesel, N örnek)
+     *    Yarım dolunca HAL_ADC_ConvHalfCpltCallback, tam dolunca HAL_ADC_ConvCpltCallback */
+    HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adc_buffer, N);
+
+    /* 5. Çıkış DMA: TIM3 her taştığında (1 kHz) dac_buffer -> GPIOB->ODR (PB0-PB7) */
+    HAL_DMA_Start(&hdma_tim3_ch4_up, (uint32_t)dac_buffer, (uint32_t)&GPIOB->ODR, N);
+    __HAL_TIM_ENABLE_DMA(&htim3, TIM_DMA_UPDATE);
+
+    /* 6. TIM3'ü başlat: hem ADC'yi tetikler (TRGO) hem de DAC DMA'sını sürer */
+    HAL_TIM_Base_Start(&htim3);
+}
+
+/* ============================================================================
+ * ADC DMA KESMELERİ
+ *  - İlk 16 örnek dolunca yarım tampon bayrağı
+ *  - 32 örnek dolunca tam tampon bayrağı
+ * ============================================================================ */
+void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef *hadc)
+{
+    if (hadc->Instance == ADC1) {
+        flag_half = 1;
+    }
+}
+
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
+{
+    if (hadc->Instance == ADC1) {
+        flag_full = 1;
+    }
+}
+
+/* ============================================================================
+ * ANA DÖNGÜ
+ * ============================================================================ */
+void filter_process(void)
+{
+    if (flag_half) {
+        flag_half = 0;
+        process_half_buffer();
+    }
+
+    if (flag_full) {
+        flag_full = 0;
+        process_Cplt_buffer();
+    }
+}
+
+/* --- İLK YARI TAMPON İŞLEME (0 .. halfN-1) --- */
+void process_half_buffer(void)
+{
+#if (TEST_MODE == 1)
+    /* Mod 1: Boş, hazır sinüs tablosu çıkışa basılır */
+
+#elif (TEST_MODE == 2)
+    /* Mod 2: ADC verisini (8-bit ölçeğe indirip) doğrudan çıkışa kopyala */
+    for (uint32_t i = 0U; i < halfN; i++) {
+        dac_buffer[i] = (uint16_t)(adc_buffer[i] >> 4);
+    }
+
+#elif (TEST_MODE == 3)
+    /* Mod 3: ADC -> 36 Katsayılı FIR -> 8-Bit Çıkış */
+    float input_f32[halfN];
+    float output_f32[halfN];
+
+    for (uint32_t i = 0U; i < halfN; i++) {
+        input_f32[i] = ADC_TO_8BIT(adc_buffer[i]);
+    }
+
+    my_fir_f32(&filter1, input_f32, output_f32, halfN);
+
+    for (uint32_t i = 0U; i < halfN; i++) {
+        float val = output_f32[i];
+        if (val < 0.0f)   val = 0.0f;
+        if (val > 255.0f) val = 255.0f;
+        dac_buffer[i] = (uint16_t)(val + 0.5f);
+    }
+#endif
+}
+
+/* --- İKİNCİ YARI TAMPON İŞLEME (halfN .. N-1) --- */
+void process_Cplt_buffer(void)
+{
+#if (TEST_MODE == 1)
+    /* Mod 1: Boş */
+
+#elif (TEST_MODE == 2)
+    for (uint32_t i = 0U; i < halfN; i++) {
+        dac_buffer[halfN + i] = (uint16_t)(adc_buffer[halfN + i] >> 4);
+    }
+
+#elif (TEST_MODE == 3)
+    float input_f32[halfN];
+    float output_f32[halfN];
+
+    for (uint32_t i = 0U; i < halfN; i++) {
+        input_f32[i] = ADC_TO_8BIT(adc_buffer[halfN + i]);
+    }
+
+    my_fir_f32(&filter1, input_f32, output_f32, halfN);
+
+    for (uint32_t i = 0U; i < halfN; i++) {
+        float val = output_f32[i];
+        if (val < 0.0f)   val = 0.0f;
+        if (val > 255.0f) val = 255.0f;
+        dac_buffer[halfN + i] = (uint16_t)(val + 0.5f);
+    }
+#endif
+}
